@@ -218,112 +218,299 @@ except Exception as e:
     agent = None
 
 
-def extract_user_message(data):
+def extract_user_message(params):
     """
-    Extract the user's message from Telex A2A protocol format
+    Extract the user's message from A2A protocol params
+    
+    Args:
+        params: The params object from JSON-RPC request
+        
+    Returns:
+        str: The extracted user message or None
     """
     try:
-        # Check if this is a JSON-RPC format
-        if 'params' in data:
-            params = data.get('params', {})
-            message = params.get('message', {})
-            parts = message.get('parts', [])
-        else:
-            # Direct format
-            message = data.get('message', {})
-            parts = message.get('parts', [])
+        message = params.get('message', {})
+        parts = message.get('parts', [])
         
-        # Iterate through parts in reverse to get the latest message
+        if not parts:
+            return None
+        
+        # Iterate through parts to find text
         for part in reversed(parts):
-            # Handle simple text
-            if part.get('kind') == 'text':
+            part_type = part.get('type') or part.get('kind')
+            
+            if part_type == 'text':
                 text = part.get('text', '').strip()
+                # Remove HTML tags
+                text = re.sub(r'<[^>]+>', '', text)
                 if text:
                     return text
             
-            # Handle data with nested messages
-            if part.get('kind') == 'data':
+            # Handle nested data structures (if Telex sends them)
+            if part_type == 'data':
                 data_items = part.get('data', [])
                 for item in reversed(data_items):
-                    if item.get('kind') == 'text':
+                    item_type = item.get('type') or item.get('kind')
+                    if item_type == 'text':
                         text = item.get('text', '').strip()
-                        # Remove HTML tags like <p></p>
                         text = re.sub(r'<[^>]+>', '', text)
-                        # Remove code blocks
-                        text = re.sub(r'<code>|</code>', '', text)
                         if text:
                             return text
         
         return None
+        
     except Exception as e:
         print(f"Error extracting message: {e}")
         return None
 
 
-def create_a2a_response(text, request_id=None, status="success"):
+def create_success_response(request_id, text, message_id=None):
     """
-    Create a proper A2A protocol response
+    Create a JSON-RPC 2.0 success response following A2A protocol
     
     Args:
+        request_id: The ID from the request
         text: The response text
-        request_id: The ID from the request (for JSON-RPC)
-        status: success or error
-    """
-    if status == "success":
-        return {
-            "jsonrpc": "2.0",
-            "id": request_id or str(uuid.uuid4()),
-            "result": {
-                "message": {
-                    "role": "assistant",
-                    "parts": [
-                        {
-                            "kind": "text",
-                            "text": text
-                        }
-                    ]
-                }
-            }
-        }
-    else:
-        # Error format
-        return {
-            "jsonrpc": "2.0",
-            "id": request_id or str(uuid.uuid4()),
-            "error": {
-                "code": -32000,
-                "message": text
-            }
-        }
-
-
-def create_simple_response(text, status="success"):
-    """
-    Create a simple response format (fallback)
+        message_id: Optional message ID
+        
+    Returns:
+        dict: JSON-RPC success response
     """
     return {
-        "status": status,
-        "response": text
+        "jsonrpc": "2.0",
+        "id": request_id,
+        "result": {
+            "role": "agent",
+            "parts": [
+                {
+                    "type": "text",
+                    "text": text
+                }
+            ],
+            "kind": "message",
+            "message_id": message_id or str(uuid.uuid4())
+        }
     }
 
 
-@app.route('/')
-def home():
-    """Health check endpoint"""
+def create_error_response(request_id, code, message):
+    """
+    Create a JSON-RPC 2.0 error response
+    
+    Args:
+        request_id: The ID from the request
+        code: Error code (standard JSON-RPC codes)
+        message: Error message
+        
+    Returns:
+        dict: JSON-RPC error response
+    """
+    return {
+        "jsonrpc": "2.0",
+        "id": request_id,
+        "error": {
+            "code": code,
+            "message": message
+        }
+    }
+
+
+# ============================================================================
+# A2A PROTOCOL ENDPOINTS
+# ============================================================================
+
+@app.route('/.well-known/agent.json', methods=['GET'])
+def agent_card():
+    """
+    Well-known endpoint that returns the agent card
+    This tells Telex about your agent's capabilities
+    """
+    base_url = os.getenv('BASE_URL', request.host_url.rstrip('/'))
+    
     return jsonify({
-        "status": "running",
-        "agent": "Exercise Recommendation Agent",
+        "name": "Exercise Recommender",
+        "description": "AI fitness coach that provides personalized exercise recommendations for specific body parts",
         "version": "1.0.0",
-        "endpoints": {
-            "a2a": "/a2a/agent/exerciseAgent",
-            "health": "/health"
+        "url": base_url,
+        "capabilities": {
+            "streaming": False,
+            "push_notifications": False
+        },
+        "methods": [
+            "message/send"
+        ],
+        "metadata": {
+            "author": "Your Name",
+            "category": "health",
+            "tags": ["fitness", "exercise", "health", "workout"]
         }
     })
 
 
-@app.route('/health')
+@app.route('/a2a/agent/exerciseAgent', methods=['POST'])
+async def handle_rpc_request():
+    """
+    Main A2A endpoint - handles all JSON-RPC requests
+    Routes to appropriate handler based on method
+    """
+    
+    if not agent:
+        return jsonify(create_error_response(
+            None,
+            -32603,
+            "Agent not initialized. Check GEMINI_API_KEY configuration."
+        )), 500
+    
+    try:
+        # Parse JSON-RPC request
+        body = request.get_json()
+        
+        if not body:
+            return jsonify(create_error_response(
+                None,
+                -32700,
+                "Parse error - Invalid JSON"
+            )), 400
+        
+        # Validate JSON-RPC 2.0 format
+        if body.get('jsonrpc') != '2.0':
+            return jsonify(create_error_response(
+                body.get('id'),
+                -32600,
+                "Invalid Request - must be JSON-RPC 2.0"
+            )), 400
+        
+        request_id = body.get('id')
+        method = body.get('method')
+        params = body.get('params', {})
+        
+        print("=" * 60)
+        print(f"📥 Received JSON-RPC request")
+        print(f"Method: {method}")
+        print(f"Request ID: {request_id}")
+        print("=" * 60)
+        
+        # Route to appropriate handler based on method
+        if method == "message/send":
+            result = handle_message_send(request_id, params)
+            return jsonify(result), 200
+        
+        elif method == "task/subscribe":
+            # If you want to support task subscriptions in the future
+            result = handle_task_subscription(request_id, params)
+            return jsonify(result), 200
+        
+        else:
+            # Method not found
+            print(f"❌ Unknown method: {method}")
+            return jsonify(create_error_response(
+                request_id,
+                -32601,
+                f"Method not found: {method}"
+            )), 404
+            
+    except Exception as e:
+        print(f"❌ Error processing RPC request: {e}")
+        import traceback
+        traceback.print_exc()
+        
+        return jsonify(create_error_response(
+            body.get('id') if body else None,
+            -32603,
+            f"Internal error: {str(e)}"
+        )), 500
+
+
+def handle_message_send(request_id, params):
+    """
+    Handle the message/send method
+    
+    Args:
+        request_id: The JSON-RPC request ID
+        params: The params object containing the message
+        
+    Returns:
+        dict: JSON-RPC response
+    """
+    try:
+        # Extract user message
+        user_message = extract_user_message(params)
+        
+        print(f"💬 User message: {user_message}")
+        
+        if not user_message:
+            return create_error_response(
+                request_id,
+                -32602,
+                "Invalid params - no message text found. Please provide a body part (e.g., 'arms', 'legs', 'chest')"
+            )
+        
+        # Validate input
+        is_valid, error_msg = agent.validate_input(user_message)
+        if not is_valid:
+            return create_error_response(
+                request_id,
+                -32602,
+                f"Invalid params - {error_msg}"
+            )
+        
+        # Generate response using the agent
+        result = agent.generate_response(user_message, context=None)
+        
+        if result['success']:
+            print(f"✅ Generated response for: {result['body_part']}")
+            
+            # Create success response
+            return create_success_response(
+                request_id,
+                result['response']
+            )
+        else:
+            print(f"❌ Agent error: {result.get('error')}")
+            return create_error_response(
+                request_id,
+                -32603,
+                result.get('response', 'Failed to generate response')
+            )
+            
+    except Exception as e:
+        print(f"❌ Error in handle_message_send: {e}")
+        import traceback
+        traceback.print_exc()
+        
+        return create_error_response(
+            request_id,
+            -32603,
+            f"Internal error: {str(e)}"
+        )
+
+
+def handle_task_subscription(request_id, params):
+    """
+    Handle the task/subscribe method (if needed in future)
+    
+    Args:
+        request_id: The JSON-RPC request ID
+        params: The params object
+        
+    Returns:
+        dict: JSON-RPC response
+    """
+    # For now, return not implemented
+    return create_error_response(
+        request_id,
+        -32601,
+        "Method not implemented: task/subscribe"
+    )
+
+
+# ============================================================================
+# HEALTH CHECK ENDPOINTS (Optional - for monitoring)
+# ============================================================================
+
+@app.route('/health', methods=['GET'])
 def health():
-    """Detailed health check"""
+    """Health check endpoint"""
     agent_status = "healthy" if agent else "not initialized"
     return jsonify({
         "status": "ok",
@@ -332,146 +519,37 @@ def health():
     })
 
 
-@app.route('/a2a/agent/exerciseAgent', methods=['POST'])
-def exercise_agent_endpoint():
-    """
-    A2A Protocol endpoint for Telex.im integration
-    
-    Supports both JSON-RPC 2.0 and simple formats
-    """
-    
-    if not agent:
-        error_response = create_simple_response(
-            "Agent not initialized. Check GEMINI_API_KEY configuration.",
-            status="error"
-        )
-        return jsonify(error_response), 500
-    
-    try:
-        # Parse incoming request
-        data = request.get_json()
-        
-        if not data:
-            error_response = create_simple_response(
-                "No JSON data provided",
-                status="error"
-            )
-            return jsonify(error_response), 400
-        
-        # Get request ID for JSON-RPC format
-        request_id = data.get('id')
-        
-        # Detect if this is JSON-RPC format
-        is_jsonrpc = 'jsonrpc' in data and data.get('jsonrpc') == '2.0'
-        
-        # Debug: Log incoming data structure
-        print("=" * 50)
-        print(f"Request format: {'JSON-RPC 2.0' if is_jsonrpc else 'Simple'}")
-        print(f"Request ID: {request_id}")
-        
-        # Extract user message from Telex A2A format
-        user_message = extract_user_message(data)
-        
-        print(f"Extracted message: {user_message}")
-        print("=" * 50)
-        
-        if not user_message:
-            error_text = "Please provide a body part to exercise (e.g., 'arms', 'legs', 'chest', 'back')"
-            
-            if is_jsonrpc:
-                response = create_a2a_response(error_text, request_id, status="error")
-            else:
-                response = create_simple_response(error_text, status="error")
-            
-            return jsonify(response), 400
-        
-        # Get metadata
-        if 'params' in data:
-            metadata = data.get('params', {}).get('message', {}).get('metadata', {})
-        else:
-            metadata = data.get('message', {}).get('metadata', {})
-        
-        user_id = metadata.get('telex_user_id', 'anonymous')
-        
-        # Log the request
-        print(f"✓ Processing request from {user_id}: {user_message}")
-        
-        # Validate input
-        is_valid, error_msg = agent.validate_input(user_message)
-        if not is_valid:
-            if is_jsonrpc:
-                response = create_a2a_response(error_msg, request_id, status="error")
-            else:
-                response = create_simple_response(error_msg, status="error")
-            
-            return jsonify(response), 400
-        
-        # Generate response
-        result = agent.generate_response(user_message, context=None)
-        
-        # Return response in appropriate format
-        if result['success']:
-            print(f"✓ Generated response for body part: {result['body_part']}")
-            
-            if is_jsonrpc:
-                response = create_a2a_response(result['response'], request_id)
-            else:
-                response = create_simple_response(result['response'])
-            
-            return jsonify(response), 200
-        else:
-            print(f"✗ Error generating response: {result.get('error')}")
-            
-            if is_jsonrpc:
-                response = create_a2a_response(result['response'], request_id, status="error")
-            else:
-                response = create_simple_response(result['response'], status="error")
-            
-            return jsonify(response), 500
-            
-    except Exception as e:
-        print(f"✗ Error processing request: {e}")
-        import traceback
-        traceback.print_exc()
-        
-        error_text = "Sorry, I encountered an error. Please try again."
-        
-        # Try to determine format from request
-        try:
-            is_jsonrpc = 'jsonrpc' in request.get_json()
-            request_id = request.get_json().get('id') if is_jsonrpc else None
-        except:
-            is_jsonrpc = False
-            request_id = None
-        
-        if is_jsonrpc:
-            response = create_a2a_response(error_text, request_id, status="error")
-        else:
-            response = create_simple_response(error_text, status="error")
-        
-        return jsonify(response), 500
-
+# ============================================================================
+# ERROR HANDLERS
+# ============================================================================
 
 @app.errorhandler(404)
 def not_found(e):
-    return jsonify({
-        "status": "error",
-        "error": "Endpoint not found"
-    }), 404
+    return jsonify(create_error_response(
+        None,
+        -32601,
+        "Endpoint not found"
+    )), 404
 
 
 @app.errorhandler(500)
 def internal_error(e):
-    return jsonify({
-        "status": "error",
-        "error": "Internal server error"
-    }), 500
+    return jsonify(create_error_response(
+        None,
+        -32603,
+        "Internal server error"
+    )), 500
 
 
 if __name__ == '__main__':
     port = int(os.getenv('PORT', 5000))
     debug = os.getenv('FLASK_ENV') == 'development'
     
-    print(f"Starting Exercise Agent on port {port}...")
+    print("=" * 60)
+    print("🏋️ Starting Exercise Recommender Agent")
+    print(f"Port: {port}")
     print(f"Agent initialized: {agent is not None}")
+    print(f"Gemini API configured: {bool(os.getenv('GEMINI_API_KEY'))}")
+    print("=" * 60)
+    
     app.run(host='0.0.0.0', port=port, debug=debug)
