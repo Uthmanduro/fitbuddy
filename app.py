@@ -4,6 +4,7 @@ from agent import ExerciseAgent
 import os
 import re
 import uuid
+import datetime
 
 # Load environment variables
 load_dotenv()
@@ -65,32 +66,104 @@ def extract_user_message(params):
         return None
 
 
-def create_success_response(request_id, text, message_id=None):
-    """
-    Create a JSON-RPC 2.0 success response following A2A protocol
+# def create_success_response(request_id, text, message_id=None):
+#     """
+#     Create a JSON-RPC 2.0 success response following A2A protocol
     
-    Args:
-        request_id: The ID from the request
-        text: The response text
-        message_id: Optional message ID
+#     Args:
+#         request_id: The ID from the request
+#         text: The response text
+#         message_id: Optional message ID
         
-    Returns:
-        dict: JSON-RPC success response
+#     Returns:
+#         dict: JSON-RPC success response
+#     """
+#     return {
+#         "jsonrpc": "2.0",
+#         "id": request_id,
+#         "result": {
+#             "role": "agent",
+#             "parts": [
+#                 {
+#                     "type": "text",
+#                     "text": text
+#                 }
+#             ],
+#             "kind": "message",
+#             "message_id": message_id or str(uuid.uuid4())
+#         }
+#     }
+
+def create_success_response(request_id, text, file_url=None):
     """
+    Create a JSON-RPC 2.0 success response following the Telex A2A "task" format.
+    """
+    now_iso = datetime.datetime.utcnow().isoformat() + "Z"
+    task_id = f"task-{uuid.uuid4()}"
+    context_id = f"ctx-{uuid.uuid4()}"
+    message_id = f"msg-{uuid.uuid4()}"
+    artifact_id = f"artifact-{uuid.uuid4()}"
+
+    message_part = {
+        "kind": "text",
+        "text": text,
+        "data": None,
+        "file_url": file_url
+    }
+
     return {
         "jsonrpc": "2.0",
         "id": request_id,
         "result": {
-            "role": "agent",
-            "parts": [
+            "id": task_id,
+            "contextId": context_id,
+            "status": {
+                "state": "completed",
+                "timestamp": now_iso,
+                "message": {
+                    "kind": "message",
+                    "role": "agent",
+                    "parts": [message_part],
+                    "messageId": message_id,
+                    "taskId": task_id,
+                    "metadata": None
+                }
+            },
+            "artifacts": [
                 {
-                    "type": "text",
-                    "text": text
+                    "artifactId": artifact_id,
+                    "name": "WorkoutRecommendation",
+                    "parts": [message_part]
                 }
             ],
-            "kind": "message",
-            "message_id": message_id or str(uuid.uuid4())
-        }
+            "history": [
+                {
+                    "kind": "message",
+                    "role": "user",
+                    "parts": [
+                        {
+                            "kind": "text",
+                            "text": "",
+                            "data": None,
+                            "file_url": None
+                        }
+                    ],
+                    "messageId": f"msg-{uuid.uuid4()}",
+                    "taskId": None,
+                    "metadata": None
+                },
+                {
+                    "kind": "message",
+                    "role": "agent",
+                    "parts": [message_part],
+                    "messageId": message_id,
+                    "taskId": task_id,
+                    "metadata": None
+                }
+            ],
+            "kind": "task"
+        },
+        "error": None
     }
 
 
@@ -262,9 +335,14 @@ def handle_message_send(request_id, params):
             print(f"✅ Generated response for: {result['body_part']}")
             
             # Create success response
+            # return create_success_response(
+            #     request_id,
+            #     result['response']
+            # )
             return create_success_response(
                 request_id,
-                result['response']
+                result['response'],
+                file_url=result.get('file_url')
             )
         else:
             print(f"❌ Agent error: {result.get('error')}")
